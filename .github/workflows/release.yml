@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-26.04
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      TZ: UTC
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Bump version
+        run: |
+          set -euo pipefail
+          read -r EXTERNAL INTERNAL < <(python3 - << 'PY'
+          import re
+          from decimal import Decimal
+          from pathlib import Path
+
+          path = Path("app/build.gradle.kts")
+          text = path.read_text()
+          external = re.search(r'^private val externalVersion = "([^"]+)"', text, re.M)
+          internal = re.search(r'^private val internalVersion = (\d+)', text, re.M)
+          if external is None or internal is None:
+              raise SystemExit("version constants not found")
+          new_external = (Decimal(external.group(1)) + Decimal("0.1")).quantize(Decimal("0.1"))
+          new_internal = int(internal.group(1)) + 1
+          text = re.sub(
+              r'^private val externalVersion = "[^"]+"',
+              f'private val externalVersion = "{new_external}"',
+              text,
+              count=1,
+              flags=re.M,
+          )
+          text = re.sub(
+              r'^private val internalVersion = \d+',
+              f'private val internalVersion = {new_internal}',
+              text,
+              count=1,
+              flags=re.M,
+          )
+          path.write_text(text)
+          print(f"{new_external} {new_internal}")
+          PY
+          )
+          git add app/build.gradle.kts
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "Bump version to ${EXTERNAL} (${INTERNAL})."
+          git push
+          echo "EXTERNAL=${EXTERNAL}" >> "$GITHUB_ENV"
+          echo "INTERNAL=${INTERNAL}" >> "$GITHUB_ENV"
+
+      - name: Install SDK packages
+        run: |
+          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          else
+            sdkmanager=$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -n 1)
+          fi
+          yes | "$sdkmanager" --licenses >/dev/null || true
+          "$sdkmanager" "platforms;android-37.0" "build-tools;37.0.0"
+
+      - name: Build release APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleRelease --no-daemon -PunsignedRelease=true
+
+      - name: Sign APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          apk=$(find app/build/outputs/apk/release -name '*.apk' -print -quit)
+          name=$(basename "$apk")
+          sdk="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          build_tools=$(find "$sdk/build-tools" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)
+          "$build_tools/apksigner" sign \
+            --ks "$RUNNER_TEMP/release.jks" \
+            --ks-pass env:STORE_PASSWORD \
+            --key-pass env:KEY_PASSWORD \
+            --ks-key-alias "$KEY_ALIAS" \
+            --out "$RUNNER_TEMP/$name" \
+            "$apk"
+          cp "$RUNNER_TEMP/$name" "$name"
+          echo "APK_NAME=${name}" >> "$GITHUB_ENV"
+          title="${name#HMA OSS Detector-}"
+          echo "RELEASE_TITLE=${title%.apk}" >> "$GITHUB_ENV"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$EXTERNAL" "${APK_NAME}#${APK_NAME}" \
+            --title "$RELEASE_TITLE" \
+            --notes "Version ${EXTERNAL} (build ${INTERNAL}). Build timestamps use UTC."
