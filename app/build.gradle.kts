@@ -24,8 +24,8 @@ plugins {
 }
 
 private val appDisplayName = "HMA OSS Detector"
-private val externalVersion = "1.1"
-private val internalVersion = 16
+private val externalVersion = "1.2"
+private val internalVersion = 17
 private val buildTime = LocalDateTime.now(ZoneOffset.UTC)
     .format(DateTimeFormatter.ofPattern("yyyyMMddHHmm"))
 private val unsignedRelease = providers.gradleProperty("unsignedRelease")
